@@ -9,7 +9,6 @@ import time
 import random
 import logging
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from language_model_service_api.languagemodelservice_api_completion_v3 import GenericVisionCompletionRequest
 from language_model_service_api.languagemodelservice_api import (
@@ -21,21 +20,15 @@ from language_model_service_api.languagemodelservice_api import (
 )
 from palantir_models.transforms import GenericVisionCompletionLanguageModelInput
 
-# Setup logging
-logger = logging.getLogger(__name__)
-
+# Compile regex pattern at module level for efficiency
 IMAGE_PATTERN = re.compile(r'!\[([^\]]*)\]\(data:image/(jpeg|png);base64,([^)]+)\)')
-
-# Configuration constants
-MAX_CONCURRENT_LLM_CALLS = 5  # Adjust based on API rate limits
-LLM_TIMEOUT_SECONDS = 120  # Timeout per LLM call
 
 prompt = """
 FIRST : Check if photo is a logo, find out the company name and output "Logo" and skip the following instructions.
 SECOND : Check if photo is a header/banner, if it is give a short description of the visual and skip the following instructions.
 THIRD : Check if photo is a person/place/object/animal, if it is just give a short description of the photo and skip the following instructions.
 THEN : You are an elite Macroeconomic Research Analyst, given the chart and the legends extract a table representing the information at all data points. Give output in the format of a markdown table. This table should be able to output the chart exactly later on. Omit any niceties, directly output the table.
-Provide analysis on qunatitative data shown in the chart, specify values shown while giving the detailed analysis.
+Provide analysis on quantitative data shown in the chart, specify values shown while giving the detailed analysis.
 Only use "\n" to write new lines, dont use "\n\n"
 At the end add "Warning : These values have been estimated from a chart, make sure to verify before use"
 """
@@ -56,14 +49,20 @@ At the end add "Warning : These values have been estimated from a chart, make su
     model=GenericVisionCompletionLanguageModelInput("ri.language-model-service..language-model.gemini-2-5-pro")
 )
 def compute(ctx, mds, model, md_output):
+    # Get logger at module level (will be recreated in UDF)
+    main_logger = logging.getLogger(__name__)
 
-    def get_chart_analysis_fromBase64(im_b64):
-        """Analyze image with vision LLM, with retry logic"""
+    def get_chart_analysis_fromBase64(im_b64, image_type, attempt_logger):
+        """Analyze image with vision LLM, with proper exponential backoff retry logic
+
+        Args:
+            im_b64: Base64 encoded image data
+            image_type: Image type from regex ('jpeg' or 'png')
+            attempt_logger: Logger instance for this attempt
+        """
         prompt_content = GenericMessageContent(text=prompt)
-        if im_b64.startswith('/9'):
-            im_type = MimeType.IMAGE_JPEG
-        else:
-            im_type = MimeType.IMAGE_PNG
+        # Use the captured image type from regex instead of unreliable base64 detection
+        im_type = MimeType.IMAGE_JPEG if image_type == 'jpeg' else MimeType.IMAGE_PNG
         max_retries = 5
 
         for attempt in range(max_retries):
@@ -79,38 +78,36 @@ def compute(ctx, mds, model, md_output):
 
             except Exception as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"Failed after {max_retries} attempts: {e}")
+                    attempt_logger.error(f"Failed after {max_retries} attempts: {e}")
                     return f"Error processing image: {str(e)[:100]}"
 
-                # Exponential backoff with jitter
-                delay = (45) + random.uniform(0, 30)
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                logger.warning(f"Retrying in {delay:.2f} seconds...")
+                # FIXED: Proper exponential backoff: 5s, 10s, 20s, 40s, 80s + jitter
+                delay = (2 ** attempt) * 5 + random.uniform(0, 5)
+                attempt_logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                attempt_logger.warning(f"Retrying in {delay:.2f} seconds...")
                 time.sleep(delay)
-
-    def call_llm_for_image(img_b64):
-        """
-        Wrapper function for calling LLM on a single image.
-        This function is submitted to ThreadPoolExecutor.
-        Returns tuple of (img_b64, analysis_result)
-        """
-        try:
-            analysis = get_chart_analysis_fromBase64(img_b64)
-            return (img_b64, analysis)
-        except Exception as e:
-            logger.error(f"Error in LLM call for image: {e}")
-            return (img_b64, f"Error processing image: {str(e)[:100]}")
 
     markdowns = mds.dataframe()
 
-    logger.info(f"Processing {markdowns.count()} markdown pages")
+    main_logger.info(f"Processing {markdowns.count()} markdown pages")
 
     def analyse_page(text):
-        """Process all images in a page of markdown - PARALLELIZED VERSION"""
+        """Process all images in a page of markdown.
+
+        FIXED: Removed ThreadPoolExecutor nested parallelism anti-pattern.
+        Now processes images sequentially per page, letting Spark's 16 executors
+        provide parallelism across pages. This prevents uncontrolled concurrency
+        (previously: 16 executors × 5 threads = 80 concurrent API calls).
+        """
+        # FIXED: Initialize logger inside UDF for proper serialization
+        page_logger = logging.getLogger(__name__)
+
         if not text or len(text.strip()) == 0:
             return text
 
         try:
+            # Dictionary to store unique images and their analyses
+            # Key: base64 data, Value: tuple of (image_type, analysis_result)
             image_dict = {}
 
             matches = IMAGE_PATTERN.findall(text)
@@ -118,65 +115,54 @@ def compute(ctx, mds, model, md_output):
             if not matches:
                 return text
 
-            logger.info(f"Processing {len(matches)} images in page")
+            page_logger.info(f"Processing {len(matches)} images in page")
 
-            # Step 1: Identify unique images and filter by size
+            # Step 1: Identify unique images, filter by size, and store image type
             for explanation, image_type, base64_data in matches:
                 if base64_data not in image_dict:
                     estimated_size = len(base64_data) * 0.75
                     max_size = 5 * 1024 * 1024  # 5MB
 
                     if estimated_size > max_size:
-                        logger.warning(f"Skipping large image (estimated {estimated_size/1024/1024:.1f}MB)")
-                        image_dict[base64_data] = "Image too large to process safely"
+                        page_logger.warning(f"Skipping large image (estimated {estimated_size/1024/1024:.1f}MB)")
+                        image_dict[base64_data] = (image_type, "Image too large to process safely")
                     else:
-                        image_dict[base64_data] = None
+                        # Store image type from regex for later use
+                        image_dict[base64_data] = (image_type, None)
 
-            # Step 2: Parallel processing of images that need analysis
-            images_to_process = [img_b64 for img_b64, analysis in image_dict.items() if analysis is None]
+            # Step 2: Sequential processing of images (Spark executors provide parallelism)
+            images_to_process = [(img_b64, img_type) for img_b64, (img_type, analysis) in image_dict.items() if analysis is None]
 
             if images_to_process:
-                logger.info(f"Analyzing {len(images_to_process)} unique images in parallel (max_workers={MAX_CONCURRENT_LLM_CALLS})")
-                parallel_start = time.time()
+                page_logger.info(f"Analyzing {len(images_to_process)} unique images sequentially")
+                processing_start = time.time()
 
-                # Use ThreadPoolExecutor for parallel LLM calls (similar to reference code)
-                with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_CALLS) as executor:
-                    # Submit all tasks
-                    future_to_image = {
-                        executor.submit(call_llm_for_image, img_b64): img_b64
-                        for img_b64 in images_to_process
-                    }
+                for idx, (img_b64, img_type) in enumerate(images_to_process, 1):
+                    # FIXED: Pass image_type from regex and logger instance
+                    analysis = get_chart_analysis_fromBase64(img_b64, img_type, page_logger)
+                    image_dict[img_b64] = (img_type, analysis)
 
-                    # Collect results as they complete
-                    completed_count = 0
-                    for future in as_completed(future_to_image, timeout=LLM_TIMEOUT_SECONDS * len(images_to_process)):
-                        try:
-                            img_b64, analysis = future.result(timeout=LLM_TIMEOUT_SECONDS)
-                            image_dict[img_b64] = analysis
-                            completed_count += 1
+                    if idx % 5 == 0 or idx == len(images_to_process):
+                        page_logger.info(f"Completed {idx}/{len(images_to_process)} image analyses")
 
-                            if completed_count % 5 == 0 or completed_count == len(images_to_process):
-                                logger.info(f"Completed {completed_count}/{len(images_to_process)} image analyses")
-
-                        except Exception as e:
-                            img_b64 = future_to_image[future]
-                            logger.error(f"Failed to analyze image: {e}")
-                            image_dict[img_b64] = f"Error processing image: {str(e)[:100]}"
-
-                parallel_duration = time.time() - parallel_start
-                logger.info(f"Parallel processing completed {len(images_to_process)} images in {parallel_duration:.2f}s "
-                           f"(avg {parallel_duration/len(images_to_process):.2f}s per image)")
+                processing_duration = time.time() - processing_start
+                page_logger.info(f"Sequential processing completed {len(images_to_process)} images in {processing_duration:.2f}s "
+                           f"(avg {processing_duration/len(images_to_process):.2f}s per image)")
 
             # Step 3: Replace images with analysis in markdown
-            md = IMAGE_PATTERN.sub(
-                lambda match: f"\n<!-- Picture description:{image_dict.get(match.group(3), 'Analysis not available')}-->\n",
-                text
-            )
+            def replace_image(match):
+                base64_data = match.group(3)
+                if base64_data in image_dict:
+                    _, analysis = image_dict[base64_data]
+                    return f"\n<!-- Picture description:{analysis}-->\n"
+                return f"\n<!-- Picture description:Analysis not available-->\n"
+
+            md = IMAGE_PATTERN.sub(replace_image, text)
 
             return md
 
         except Exception as e:
-            logger.error(f"Error in analyse_page: {e}")
+            page_logger.error(f"Error in analyse_page: {e}")
             return text  # Return original text on error
 
     process_page_udf = F.udf(analyse_page, StringType())
@@ -199,15 +185,16 @@ def compute(ctx, mds, model, md_output):
 
     merge_udf = udf(merge_timestamp_udf, StringType())
 
-    logger.info("Detecting pages with images...")
+    main_logger.info("Detecting pages with images...")
     markdowns = markdowns.withColumn(
         "has_image",
         col("converted_markdown").rlike(r'!\[([^\]]*)\]\(data:image/(jpeg|png);base64,([^)]+)\)')
     )
 
     images_count = markdowns.filter(col("has_image") == True).count()
-    logger.info(f"Found {images_count} pages with images")
+    main_logger.info(f"Found {images_count} pages with images")
 
+    # FIXED: Process only pages with images, set status correctly, drop temp column
     markdowns = markdowns.withColumn(
         "converted_markdown",
         when(col("has_image") == True,
@@ -215,12 +202,14 @@ def compute(ctx, mds, model, md_output):
         .otherwise(col("converted_markdown"))
     ).withColumn(
         "status",
-        F.lit("Images Analyzed")
+        # FIXED: Only set "Images Analyzed" for pages that had images
+        when(col("has_image") == True, F.lit("Images Analyzed"))
+        .otherwise(F.coalesce(col("status"), F.lit("No images")))
     ).withColumn(
         "timestamp",
         merge_udf(F.col("timestamp"))
-    )
+    ).drop("has_image")  # FIXED: Drop temporary column
 
-    logger.info("Writing output dataframe")
+    main_logger.info("Writing output dataframe")
     md_output.write_dataframe(markdowns)
-    logger.info("Transform completed successfully")
+    main_logger.info("Transform completed successfully")
