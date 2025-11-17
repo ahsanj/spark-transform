@@ -7,8 +7,12 @@ Key improvements over the original:
 - Exploded images to separate rows for better Spark parallelism
 - Removed ThreadPoolExecutor (nested parallelism anti-pattern)
 - Fixed critical issues: has_image column, timestamp tracking
-- Proper error handling and logging
-- Better memory management
+- Proper exponential backoff retry logic (10s, 20s, 40s, 80s, 160s)
+- Optimized memory usage: dropped converted_markdown from exploded rows
+- Broadcast join for efficient reconstruction
+- Persistence for intermediate results to avoid recomputation
+- Logger initialization inside UDFs for proper serialization
+- Safe single-occurrence replacement to avoid duplicate image issues
 """
 
 from transforms.api import transform, Output, Input, configure, incremental
@@ -24,7 +28,6 @@ import re
 import json
 import time
 import random
-import gc
 import logging
 from datetime import datetime
 
@@ -57,7 +60,7 @@ FIRST : Check if photo is a logo, find out the company name and output "Logo of 
 SECOND : Check if photo is a header/banner, if it is give a short description of the visual and skip the following instructions.
 THIRD : Check if photo is a person/place/object/animal, if it is just give a short description of the photo and skip the following instructions.
 THEN : You are an elite Macroeconomic Research Analyst, given the chart and the legends extract a table representing the information at all data points. Give output in the format of a markdown table. This table should be able to output the chart exactly later on. Omit any niceties, directly output the table.
-Provide analysis on qunatitative data shown in the chart, specify values shown while giving the detailed analysis.
+Provide analysis on quantitative data shown in the chart, specify values shown while giving the detailed analysis.
 Only use "\n" to write new lines, dont use "\n\n"
 At the end add "Warning : These values have been estimated from a chart, make sure to verify before use"
 """
@@ -90,6 +93,9 @@ def compute(ctx, mds, model, md_output):
     logger.info("Step 1: Extracting images from markdown documents...")
     images_df = extract_images_to_rows(markdowns)
 
+    # Persist extracted images to avoid recomputation (triggers count() action)
+    images_df = images_df.persist(StorageLevel.MEMORY_AND_DISK)
+
     total_images = images_df.count()
     logger.info(f"Extracted {total_images} images from markdown documents")
 
@@ -108,6 +114,9 @@ def compute(ctx, mds, model, md_output):
     # STEP 2: Process images (Spark handles parallelism)
     logger.info("Step 2: Processing images with vision LLM...")
     analyzed_images_df = process_images_with_llm(images_df, model)
+
+    # Unpersist images_df after processing to free memory
+    images_df.unpersist()
 
     # STEP 3: Join results back and reconstruct markdown
     logger.info("Step 3: Reconstructing markdown with image analysis...")
@@ -149,6 +158,9 @@ def extract_images_to_rows(markdowns_df):
 
     def extract_images_udf(markdown_text):
         """Extract all images from markdown and return as array of structs"""
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not markdown_text or len(markdown_text.strip()) == 0:
             return []
 
@@ -222,11 +234,16 @@ def extract_images_to_rows(markdowns_df):
     )
 
     # Filter to only pages with images and explode
+    # NOTE: We don't include converted_markdown here to avoid duplicating large text for each image
     images_df = (
         markdowns_with_images
         .filter(col("has_image"))
         .select(
-            "*",
+            col("page_id"),
+            col("originalMediaItemRid"),
+            col("originalMediaReference"),
+            col("originalPath"),
+            col("pageNumber"),
             explode(col("extracted_images")).alias("image_data")
         )
         .select(
@@ -235,7 +252,6 @@ def extract_images_to_rows(markdowns_df):
             col("originalMediaReference"),
             col("originalPath"),
             col("pageNumber"),
-            col("converted_markdown"),
             col("image_data.image_index").alias("image_index"),
             col("image_data.image_base64").alias("image_base64"),
             col("image_data.image_type").alias("image_type"),
@@ -259,15 +275,15 @@ def process_images_with_llm(images_df, model):
         Analyze a single image using the vision LLM.
         This runs once per image, distributed by Spark.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not image_base64:
             return "Error: Empty image data"
 
         try:
-            # Determine MIME type
-            if image_type == "jpeg" or image_base64.startswith('/9'):
-                mime_type = MimeType.IMAGE_JPEG
-            else:
-                mime_type = MimeType.IMAGE_PNG
+            # Determine MIME type from regex-captured image_type
+            mime_type = MimeType.IMAGE_JPEG if image_type == "jpeg" else MimeType.IMAGE_PNG
 
             # Retry logic with exponential backoff
             for attempt in range(MAX_RETRIES):
@@ -292,10 +308,6 @@ def process_images_with_llm(images_df, model):
 
                     response = model.create_vision_completion(request).completion
 
-                    # Clean up memory
-                    del request
-                    gc.collect()
-
                     return response
 
                 except Exception as e:
@@ -304,10 +316,8 @@ def process_images_with_llm(images_df, model):
                         logger.error(error_msg)
                         return f"Error processing image: {str(e)[:100]}"
 
-                    # Exponential backoff with jitter
-                    base_delay = BASE_RETRY_DELAY + (attempt * 10)
-                    jitter = random.uniform(0, 15)
-                    delay = base_delay + jitter
+                    # Exponential backoff with jitter: 10s, 20s, 40s, 80s, 160s
+                    delay = (2 ** attempt) * BASE_RETRY_DELAY + random.uniform(0, 5)
 
                     logger.warning(f"Attempt {attempt + 1} failed: {e}")
                     logger.warning(f"Retrying in {delay:.2f} seconds...")
@@ -365,9 +375,9 @@ def reconstruct_markdown_with_analysis(markdowns_df, analyzed_images_df):
         )
     )
 
-    # Join back to original markdown
+    # Join back to original markdown (broadcast small images_by_page for efficiency)
     joined_df = markdowns_with_id.join(
-        images_by_page,
+        broadcast(images_by_page),
         on="page_id",
         how="left"
     )
@@ -375,6 +385,9 @@ def reconstruct_markdown_with_analysis(markdowns_df, analyzed_images_df):
     # UDF to replace images with analysis
     def replace_images_udf(markdown_text, replacements):
         """Replace all image references with their analysis"""
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not replacements or not markdown_text:
             return markdown_text
 
@@ -391,8 +404,8 @@ def reconstruct_markdown_with_analysis(markdowns_df, analyzed_images_df):
                 # Create replacement text
                 replacement_text = f"\n<!-- Picture description: {analysis} -->\n"
 
-                # Replace in markdown
-                result = result.replace(original, replacement_text)
+                # Replace only the first occurrence to avoid issues with duplicate images
+                result = result.replace(original, replacement_text, 1)
 
             return result
 
@@ -426,6 +439,10 @@ def add_timestamp_tracking(df):
     Add timestamp tracking for this processing stage.
     FIX: This was defined but never applied in the original code!
     """
+    # Add timestamp column if it doesn't exist
+    if "timestamp" not in df.columns:
+        df = df.withColumn("timestamp", lit("{}"))
+
     current_timestamp = datetime.now().isoformat()
     current_stage = "image analysis completed"
 
