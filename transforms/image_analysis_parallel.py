@@ -278,7 +278,7 @@ def reconstruct_markdown(all_markdowns, analyzed_images):
             for replacement in sorted_replacements:
                 original = replacement.original_match
                 analysis = replacement.analysis
-                replacement_text = f"\n<!-- Picture description: {analysis} -->\n"
+                replacement_text = f"\n<!-- Picture description:{analysis}-->\n"
                 result = result.replace(original, replacement_text, 1)
 
             return result
@@ -323,8 +323,7 @@ def apply_metadata_updates(df):
 
     df = df.withColumn(
         "status",
-        when(col("has_image"), lit("Images Analyzed"))
-        .otherwise(lit("No images to analyze"))
+        lit("Images Analyzed")  # Set for ALL rows, matching original behavior
     ).withColumn(
         "timestamp",
         merge_udf(col("timestamp"))
