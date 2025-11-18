@@ -124,14 +124,19 @@ def extract_images_to_rows(df_with_images):
             return []
 
         try:
-            matches = IMAGE_PATTERN.findall(markdown_text)
+            # Use finditer to get full match objects (not just groups)
+            matches = list(IMAGE_PATTERN.finditer(markdown_text))
             if not matches:
                 return []
 
             matches = matches[:MAX_IMAGES_PER_PAGE]
 
             result = []
-            for idx, (explanation, image_type, base64_data) in enumerate(matches):
+            for idx, match in enumerate(matches):
+                explanation = match.group(1)
+                image_type = match.group(2)
+                base64_data = match.group(3)
+
                 estimated_size = len(base64_data) * 0.75
                 if estimated_size > MAX_IMAGE_SIZE_BYTES:
                     logger.warning(f"Skipping large image (estimated {estimated_size/1024/1024:.1f}MB)")
@@ -141,7 +146,7 @@ def extract_images_to_rows(df_with_images):
                     "image_index": idx,
                     "image_base64": base64_data,
                     "image_type": image_type,
-                    "original_match": f"![{explanation}](data:image/{image_type};base64,{base64_data})"
+                    "original_match": match.group(0)  # Capture EXACT original string!
                 })
 
             return result
